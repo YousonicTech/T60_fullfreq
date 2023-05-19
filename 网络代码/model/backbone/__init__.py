@@ -1,4 +1,4 @@
-from backbone import resnet
+from model.backbone import resnet
 
 def build_backbone(back_bone):
     if back_bone == 'resnet50':

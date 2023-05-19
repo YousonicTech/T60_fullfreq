@@ -19,7 +19,7 @@ class AutomaticWeightedLoss(nn.Module):
         params = torch.ones(num, requires_grad=True)
         self.params = torch.nn.Parameter(params)
 
-    def forward(self, x):
+    def forward(self, *x):
         loss_sum = 0
         for i, loss in enumerate(x):
             loss_sum += 0.5 / (self.params[i] ** 2) * loss + torch.log(1 + self.params[i] ** 2)
@@ -29,4 +29,4 @@ if __name__ == '__main__':
     awl = AutomaticWeightedLoss(2)
     a = torch.Tensor([1.352])
     b = torch.Tensor([4.222])
-    print(awl.parameters(a, b))
+    print(awl(a, b))

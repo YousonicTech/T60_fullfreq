@@ -8,6 +8,7 @@
 """
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import cv2
 import matplotlib.pyplot as plt
@@ -18,17 +19,13 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from AutomaticWeightedLoss import AutomaticWeightedLoss
 torch.multiprocessing.set_sharing_strategy('file_system')
-import valdata_meant60
-from valdata_meant60 import Val_meanT60
 from torch.utils.tensorboard import SummaryWriter
 import os
 import glob
 from new_data_load_original import Dataset_dict, collate_fn
 from SSIMLoss import ssim
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from model.attentionFPN import FPN
 from torch.utils.data import Dataset, DataLoader
@@ -37,7 +34,6 @@ from data_load import Rescale, RandomCrop
 from torchvision.transforms import Normalize, ToTensor
 import torch.optim as optim
 import datetime
-from valdata_meant60 import ValDataset, Val_meanT60
 import argparse
 
 torch.backends.cudnn.benchmark = True
@@ -46,13 +42,13 @@ torch.backends.cudnn.benchmark = True
 def parse_args():
     parser = argparse.ArgumentParser(description='Whatever')
     parser.add_argument('--trained_epoch', type=int, default=0)
-    parser.add_argument('--save_dir', type=str, default='save_model/0914_2000Hz_FPN_lre5_alpha1_beta04')  # 需要改一下倍频程
+    parser.add_argument('--save_dir', type=str, default='save_model/0519_4Freq_1e5')  # 需要改一下倍频程
     parser.add_argument('--model_path', type=str, default='save_model/')
     parser.add_argument('--load_pretrain', type=bool, default=False)
     # 125Hz:(0, 7); 250Hz:(1, 10); 500Hz:(2, 13); 1kHz:(3, 16); 2kHz:(4, 19)
     parser.add_argument('--which_freq', type=int, default=4)  # 换倍频程
-    parser.add_argument('--freq_loc', type=int, default=19)  # 换倍频程
-    parser.add_argument('--ln_out', type=int, default=1)
+    parser.add_argument('--freq_loc', type=int, default=[10, 13, 16, 19])  # 换倍频程
+    parser.add_argument('--ln_out', type=int, default=4)
     parser.add_argument('--start_freq', type=int, default=0)
     parser.add_argument('--end_freq', type=int, default=29)
     parser.add_argument('--alpha', type=float, default=1)  # MSE loss
@@ -76,7 +72,6 @@ def load_checkpoint(checkpoint_path=None, trained_epoch=None, model=None, device
 
 def net_sample_output():
     for i, sample in enumerate(val_loader):
-
         images = sample['image']
         t60 = sample['t60']
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,16 +103,17 @@ def val_net(net, epoch, val_loader, writer):
         progress_bar = tqdm(val_loader)
         for j, datas in enumerate(progress_bar):
             images_reshape = datas['image'].to(torch.float32).to(device)
+            gt_t60_reshape = datas['t60'].to(torch.float32).to(device)
+            gt_t60_reshape = gt_t60_reshape.T[args.freq_loc].T  # [total_slices, 4]
+            rir_reshape = datas['rir'].to(torch.float32).to(device)
             valid_len = datas['validlen']
-            gt_t60_reshape = datas['t60'].to(torch.float32).to(device).unsqueeze(1)
-            clean_reshape = datas['clean'].to(torch.float32).to(device)
-            gt_t60_reshape = gt_t60_reshape.T[args.freq_loc].T  # [total_slices, 1]
 
-            output_pts, dereverb_out = net(images_reshape)
+            output_pts, dereverb_out = net(images_reshape, valid_len)
+            # print('shapes:', images_reshape.shape, rir_reshape.shape, gt_t60_reshape.shape, output_pts.shape)
 
             mse_loss = criterion(output_pts, gt_t60_reshape)
-            ssim_loss = (1 - ssim(dereverb_out, clean_reshape))
-            loss = args.alpha * mse_loss + args.beta * ssim_loss
+            ssim_loss = (1 - ssim(dereverb_out, rir_reshape))
+            loss = awl(mse_loss, ssim_loss)
 
             bias = torch.sum((gt_t60_reshape - output_pts)) / output_pts.shape[0]
 
@@ -145,8 +141,8 @@ def train_net(start_epoch, n_epochs, train_loader, val_loader, batch_size, args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lr = torch.optim.lr_scheduler.StepLR(optimizer,
-                                         step_size=20,
-                                         gamma=0.1, last_epoch=start_epoch)
+                                         step_size=10,
+                                         gamma=0.5, last_epoch=start_epoch)
 
     print("lr at beginning:", lr.get_last_lr())
     net.train()
@@ -167,20 +163,28 @@ def train_net(start_epoch, n_epochs, train_loader, val_loader, batch_size, args)
         total_mean_bias = 0
         progress_bar = tqdm(train_loader)
 
+        # if epoch % 1 == 0:
+        #     print("eval")
+        #     val_net(net, epoch, val_loader, writer)
+        #     net.train()
+
         for batch_i, datas in enumerate(progress_bar):
             # images_reshape = [batch, 3, 224, 224]
             images_reshape = datas['image'].to(torch.float32).to(device)
-            gt_t60_reshape = datas['t60'].to(torch.float32).to(device).unsqueeze(1)
-            clean_reshape = datas['clean'].to(torch.float32).to(device)
-            # gt_t60_reshape / output_pts = [28, 1]
+            gt_t60_reshape = datas['t60'].to(torch.float32).to(device)
+            rir_reshape = datas['rir'].to(torch.float32).to(device)
             gt_t60_reshape = gt_t60_reshape.T[args.freq_loc].T  # [total_slices, 1]
-
-            output_pts, dereverb_out = net(images_reshape)  # [total_slice, 1], [total_slice, 3, 224, 224]
+            valid_len = datas['validlen']
+            output_pts, dereverb_out = net(images_reshape, valid_len)  # [total_slice, 1], [total_slice, 3, 224, 224]
+            # print('shapes:', images_reshape.shape, rir_reshape.shape, gt_t60_reshape.shape, output_pts.shape)
 
             mse_loss = criterion(output_pts, gt_t60_reshape)
-            ssim_loss = (1 - ssim(dereverb_out, clean_reshape))
+            ssim_loss = (1 - ssim(dereverb_out, rir_reshape))
+            
+            if batch_i % 100 == 0:
+                print(f"mse:{mse_loss.item()}, ssim:{ssim_loss.item()}")
 
-            loss = args.alpha * mse_loss + args.beta * ssim_loss
+            loss = awl(mse_loss, ssim_loss)
 
             optimizer.zero_grad()
             loss.backward()
@@ -193,6 +197,7 @@ def train_net(start_epoch, n_epochs, train_loader, val_loader, batch_size, args)
             total_mse_loss += mse_loss.item()
             total_ssim_loss += ssim_loss.item()
 
+
         mean_loss = total_mean_loss / len(train_loader)
         mean_bias = total_mean_bias / len(train_loader)
         mean_mse_loss = total_mse_loss / len(train_loader)
@@ -202,6 +207,8 @@ def train_net(start_epoch, n_epochs, train_loader, val_loader, batch_size, args)
         writer.add_scalar('train/mean_ssim_loss', mean_ssim_loss, epoch)
         writer.add_scalar('train/mean_bias', mean_bias, epoch)
         writer.add_scalar('lr/lr', lr.get_last_lr()[-1], epoch)
+        writer.add_scalar('lr/MSE param', awl.params[0], epoch)
+        writer.add_scalar('lr/SSIM param', awl.params[1], epoch)
 
         print("In training, epoch {},mse is {},bias is {}".format(epoch, mean_loss, mean_bias))
         lr.step()
@@ -264,9 +271,10 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = args.model_path
-    net = FPN(num_blocks=[2, 4, 23, 3], num_classes=4, back_bone="resnet50", pretrained=False)
+    net = FPN(num_blocks=[2, 4, 23, 3], num_classes=4, back_bone="resnet50", pretrained=False, ln_out=args.ln_out)
+    global awl
+    awl = AutomaticWeightedLoss(2)
 
-    ### 这个判断的作用，用来计时
     if LOAD_PRETRAIN == True:
         start_time = time.time()
         net, trained_epoch = load_checkpoint(model_path, 99, net, device)
@@ -277,15 +285,16 @@ if __name__ == "__main__":
         trained_epoch = 0
     net.to(device)
 
-    # print(net)
 
     criterion = torch.nn.MSELoss()
-    optimizer = optim.Adam([{'params': net.parameters(), 'initial_lr': 1e-5}], lr=1e-5, weight_decay=0.000001)
+    optimizer = optim.Adam([
+        {'params': net.parameters(), 'initial_lr': 1e-5},
+        {'params': awl.parameters(), 'weight_decay': 0, 'initial_lr': 1e-5}
+    ], lr=1e-5, weight_decay=0.000001)
     n_epochs = 100
     data_transform = transforms.Compose([transforms.Resize([224, 224])])
 
 
-    # 网络参数数量的作用
     def get_parameter_number(net):
         total_num = sum(p.numel() for p in net.parameters())
         trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -301,23 +310,24 @@ if __name__ == "__main__":
         val_batch_size = 2
         failed_file = "/Users/bajianxiang/Desktop/internship/FPN_dataset/koli-national-park-winter_koli_snow_site4_1way_bformat_1_koli-national-park-winter_东北话男声_1_TIMIT_b098_120_130_0dB-0.pt"
     else:
-        train_dict_root = "/data/xbj/..."
+        train_dict_root = "/data1/zdm/t60_datasets/train/" # debug
         # train_dict_root = "/mnt/sda/xbj/0815_GEN_DATASET/train"
-        val_dict_root = "/data/xbj/..."
-        batch_size = 30
+        val_dict_root = "/data1/zdm/t60_datasets/val/" # debug
+        rir_dict_root = "/data1/zdm/t60_rir_pt/0829_1000_Rir_Data/"
+        batch_size = 6
         val_batch_size = 6
-        failed_file = "/data/xbj/..."
-
+        failed_file = "/data1/zdm/t60_datasets/train/elveden-hall-suffolk-england/elveden-hall-suffolk-england_18a_smoking_room_1_elveden-hall-suffolk-england_上海话女声_1_TIMIT_a016_40_50_0dB-0.pt"
+        
     print("train_dir:", train_dict_root)
 
-    train_transformed_dataset = Dataset_dict(root_dir=train_dict_root, transform=data_transform,
+    train_transformed_dataset = Dataset_dict(root_dir=train_dict_root, rir_dir=rir_dict_root, transform=data_transform,
                                              start_freq=args.start_freq, end_freq=args.end_freq,
-                                             which_freq=args.which_freq, failed_file=failed_file)
+                                             failed_file=failed_file)
 
     print("len of train dataset:", len(train_transformed_dataset))
 
-    val_transformed_dataset = Dataset_dict(root_dir=val_dict_root, transform=data_transform, start_freq=args.start_freq,
-                                           end_freq=args.end_freq, which_freq=args.which_freq, failed_file=failed_file,
+    val_transformed_dataset = Dataset_dict(root_dir=val_dict_root, rir_dir=rir_dict_root, transform=data_transform, start_freq=args.start_freq,
+                                           end_freq=args.end_freq, failed_file=failed_file,
                                            random_choose_slice=False)
 
     print("len of val dataset:", len(val_transformed_dataset))
@@ -342,4 +352,3 @@ if __name__ == "__main__":
     trained_epoch = args.trained_epoch
     train_net(trained_epoch, n_epochs, train_loader, val_loader, batch_size, args)
 
-    # TODO 训练时要改dict，权重名字，验证时保存的文件名和路径

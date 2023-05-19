@@ -58,12 +58,12 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, pretrained=True):
+    def __init__(self, block, layers, pretrained=False):
         super(ResNet, self).__init__()
         self.inplanes = 64
 
         # Modules
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv2d(4, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -73,8 +73,8 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
         self._init_weights()
 
-        if pretrained:
-            self._load_pretrained_model()
+        # if pretrained:
+        # self._load_pretrained_model()
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
@@ -128,7 +128,7 @@ class ResNet(nn.Module):
         self.load_state_dict(state_dict)
 
 
-def ResNet50(pretrained=True):
+def ResNet50(pretrained=False):
     """Constructs a ResNet-50 model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
